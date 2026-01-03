@@ -29,7 +29,10 @@ class LotteryClient:
     _cash_balance = "https://dhlottery.co.kr/mypage/home"
     _assign_virtual_account_1 = "https://dhlottery.co.kr/kbank.do?method=kbankInit"
     _assign_virtual_account_2 = "https://dhlottery.co.kr/kbank.do?method=kbankProcess"
-    _lotto_buy_list_url = "https://www.dhlottery.co.kr/myPage.do?method=lottoBuyList"
+    _lotto_buy_list_url = "https://dhlottery.co.kr/mypage/selectMyLotteryledger.do"
+
+    # 상수 정의
+    _DETAIL_REQUEST_DELAY = 0.5  # 상세 정보 요청 간 지연 시간 (초)
 
     def __init__(self, user_profile: User, lottery_endpoint):
         self._user_id = user_profile.username
@@ -103,8 +106,6 @@ class LotteryClient:
             if error_button:
                 raise RuntimeError("로그인에 실패했습니다. 아이디 또는 비밀번호를 확인해주세요.")
             raise RuntimeError(f"로그인에 실패했습니다. (Status: {resp.status_code}, URL: {resp.url})")
-
-        logger.info("로그인 성공")
 
         # 구매 도메인(ol.dhlottery.co.kr)에 접속하여 JSESSIONID 획득
         resp = self._session.get(f"{self._base_url}/main", timeout=10)
@@ -280,22 +281,21 @@ class LotteryClient:
         try:
             start_dt, end_dt = self._calculate_date_range(start_date, end_date)
 
-            data = {
-                "nowPage": 1,
-                "searchStartDate": start_dt.strftime("%Y%m%d"),
-                "searchEndDate": end_dt.strftime("%Y%m%d"),
-                "lottoId": "",
-                "winGrade": 2,
-                "calendarStartDt": start_dt.strftime("%Y-%m-%d"),
-                "calendarEndDt": end_dt.strftime("%Y-%m-%d"),
-                "sortOrder": "DESC",
+            params = {
+                "srchStrDt": start_dt.strftime("%Y%m%d"),
+                "srchEndDt": end_dt.strftime("%Y%m%d"),
+                "sort": "",
+                "ltGdsCd": "",
+                "winResult": "",
+                "pageNum": 1,
+                "recordCountPerPage": 100,
+                "_": int(datetime.datetime.now().timestamp() * 1000)
             }
 
-            resp = self._session.post(self._lotto_buy_list_url, data=data, timeout=10)
-            soup = BeautifulSoup(resp.text, "html5lib")
+            resp = self._session.get(self._lotto_buy_list_url, params=params, timeout=10)
+            data = resp.json()
 
-            tables = soup.find_all("table")
-            found_data = self._parse_buy_list_tables(tables)
+            found_data = self._parse_buy_list_json(data)
 
             self._lottery_endpoint.print_result_of_show_buy_list(found_data, output_format, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
 
@@ -317,94 +317,105 @@ class LotteryClient:
             end_dt = today
         return start_dt, end_dt
 
-    def _parse_buy_list_tables(self, tables):
-        found_data = []
-        for table in tables:
-            headers = [th.text.strip() for th in table.find_all("th")]
-            rows = []
-            for tr in table.find_all("tr"):
-                cols = []
-                detail_info = None
-                tds = tr.find_all("td")
-                for i, td in enumerate(tds):
-                    text = td.text.strip()
-                    cols.append(text)
+    def _parse_buy_list_json(self, response_data):
+        """새로운 JSON API 응답을 파싱하여 테이블 형식으로 변환"""
+        if not response_data or "data" not in response_data:
+            return []
 
-                    if i == 3:
-                        detail_info = self._extract_detail_info(td)
+        data = response_data.get("data", {})
+        items = data.get("list", [])
 
-                if cols:
-                    if detail_info:
-                        numbers = self._get_lotto645_detail(detail_info)
-                        time.sleep(0.5)  # 500ms sleep for dhlottery server
-                        cols[3] = numbers
-                    rows.append(cols)
+        if not items:
+            return []
 
-            if rows:
-                found_data.append({"headers": headers, "rows": rows})
-        return found_data
+        # 헤더 정의 (기존 형식 유지)
+        headers = ["구입일자", "복권명", "회차", "선택번호/복권번호", "구입매수", "당첨결과", "당첨금", "추첨일"]
+        rows = []
 
-    def _extract_detail_info(self, td):
-        link = td.find("a")
-        if link and "javascript:detailPop" in link.get("href", ""):
-            href = link.get("href")
-            match = re.search(r"detailPop\('([^']*)',\s*'([^']*)',\s*'([^']*)'\)", href)
-            if match:
-                return {
-                    "orderNo": match.group(1),
-                    "barcode": match.group(2),
-                    "issueNo": match.group(3),
-                }
-        return None
+        for item in items:
+            purchase_date = item.get("eltOrdrDt", "")
+            lottery_name = item.get("ltGdsNm", "")
+            if lottery_name == "로또645":
+                lottery_name = "로또6/45"
 
-    def _get_lotto645_detail(self, detail_info):
+            round_no = item.get("ltEpsdView", "")
+            gm_info = item.get("gmInfo", "")
+            quantity = str(item.get("prchsQty", ""))
+            win_result = item.get("ltWnResult", "")
+            ntsl_ordr_no = item.get("ntslOrdrNo", "")
+            win_amt = item.get("ltWnAmt", 0)
+            draw_date = item.get("epsdRflDt", "")
+
+            # 당첨금 포맷팅
+            win_amt_str = f"{win_amt:,}원" if win_amt > 0 else "-"
+
+            # 로또645인 경우 상세 정보 조회
+            if gm_info and item.get("ltGdsNm") == "로또645" and ntsl_ordr_no:
+                numbers = self._get_lotto645_ticket_detail(ntsl_ordr_no, gm_info, purchase_date)
+                time.sleep(self._DETAIL_REQUEST_DELAY)
+            else:
+                numbers = gm_info
+
+            rows.append([purchase_date, lottery_name, round_no, numbers, quantity, win_result, win_amt_str, draw_date])
+
+        return [{"headers": headers, "rows": rows}]
+
+    def _get_lotto645_ticket_detail(self, ntsl_ordr_no, barcode, purchase_date):
+        """로또645 티켓 상세 정보 조회
+
+        Args:
+            ntsl_ordr_no: 주문번호
+            barcode: 바코드 (gmInfo)
+            purchase_date: 구매일 (YYYY-MM-DD)
+
+        Returns:
+            str: 포맷팅된 번호 정보
+        """
         try:
-            url = (
-                f"https://www.dhlottery.co.kr/myPage.do?method=lotto645Detail"
-                f"&orderNo={detail_info['orderNo']}"
-                f"&barcode={detail_info['barcode']}"
-                f"&issueNo={detail_info['issueNo']}"
-            )
-            resp = self._session.get(url, timeout=10)
-            soup = BeautifulSoup(resp.text, "html5lib")
+            # 조회 기간 계산 (구매일 기준 전후 7일)
+            import datetime
+            purchase_dt = datetime.datetime.strptime(purchase_date, "%Y-%m-%d").date()
+            start_date = (purchase_dt - datetime.timedelta(days=7)).strftime("%Y%m%d")
+            end_date = (purchase_dt + datetime.timedelta(days=7)).strftime("%Y%m%d")
+
+            url = "https://dhlottery.co.kr/mypage/lotto645TicketDetail.do"
+            params = {
+                "ntslOrdrNo": ntsl_ordr_no,
+                "srchStrDt": start_date,
+                "srchEndDt": end_date,
+                "barcd": barcode
+            }
+
+            resp = self._session.get(url, params=params, timeout=10)
+            data = resp.json()
+
+            if not data.get("data", {}).get("success"):
+                return "조회 실패"
+
+            ticket = data["data"]["ticket"]
+            game_dtl = ticket.get("game_dtl", [])
+
+            if not game_dtl:
+                return "번호 정보 없음"
+
+            # 게임 타입 매핑
+            type_map = {1: "수동", 2: "반자동", 3: "자동"}
 
             result = []
-            selected_div = soup.find("div", {"class": "selected"})
-            if selected_div:
-                for li in selected_div.find_all("li"):
-                    strong = li.find("strong")
-                    if not strong:
-                        continue
-                    spans = strong.find_all("span")
-                    if len(spans) < 2:
-                        continue
+            for game in game_dtl:
+                idx = game.get("idx", "")
+                numbers = game.get("num", [])
+                game_type = type_map.get(game.get("type", 3), "자동")
 
-                    slot = spans[0].text.strip()
-                    mode = " ".join(spans[1].text.split())
+                if numbers:
+                    numbers_str = ' '.join(str(n) for n in numbers)
+                    result.append(f"[{idx}] {game_type}: {numbers_str}")
 
-                    nums_div = li.find("div", {"class": "nums"})
-                    if nums_div:
-                        numbers = self._extract_leaf_numbers(nums_div)
-                        if numbers:
-                            result.append(f"[{slot}] {mode}: {' '.join(numbers)}")
-
-            if result:
-                return "\n".join(result)
-
-            return "번호 확인 불가"
+            return "\n".join(result) if result else "번호 확인 불가"
 
         except Exception as e:
-            logger.error(f"로또 상세 정보 조회 실패: {e}")
+            logger.error(f"로또645 상세 조회 실패: {e}")
             return "조회 실패"
-
-    def _extract_leaf_numbers(self, nums_div):
-        numbers = []
-        for span in nums_div.find_all("span"):
-            if not span.find("span"):
-                text = span.text.strip()
-                if text.isdigit():
-                    numbers.append(text)
-        return numbers
 
     def _parse_digit(self, text):
         return int("".join(filter(str.isdigit, text)))
